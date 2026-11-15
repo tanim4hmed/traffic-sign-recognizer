@@ -2,6 +2,7 @@ import streamlit as st
 import tensorflow as tf
 import numpy as np
 from PIL import Image
+from streamlit_cropper import st_cropper
 
 st.set_page_config(page_title="AI Traffic Sign Recognizer", page_icon="🚦", layout="wide")
 
@@ -25,33 +26,98 @@ LABELS = [
     "Roundabout Mandatory", "End of No Overtaking", "End No Overtaking (Trucks)"
 ]
 
-st.title("🚦 AI Traffic Sign Recognition Dashboard")
-st.write("Upload any road or traffic sign photo to see how accurately the model recognizes it.")
+def get_sign_category_and_advice(idx):
+    if idx in [0, 1, 2, 3, 4, 5, 7, 8]:
+        return "🔴 Speed Limit Sign", "Maintain vehicle speed at or below the posted limit."
+    elif idx in [9, 10, 14, 15, 16, 17]:
+        return "⛔ Prohibitory / Mandatory Stop", "Strict road restriction. Obey right-of-way and entry rules immediately."
+    elif idx in [11, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]:
+        return "⚠️ Hazard Warning Sign", "Slow down and stay alert for upcoming road hazards or crossings."
+    elif idx in [33, 34, 35, 36, 37, 38, 39, 40]:
+        return "🔵 Mandatory Direction Sign", "You must follow the arrow direction indicated on the sign."
+    else:
+        return "ℹ️ Priority / End of Restriction", "Standard highway priority or end of previous speed/passing zone."
 
-col1, col2 = st.columns([1, 1])
+def check_out_of_distribution(pil_img, preds):
+    """Detects novelty yellow diamond signs or high-uncertainty random photos."""
+    arr = np.array(pil_img.resize((64, 64))).astype(int)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    
+    # Detect solid yellow US/novelty signs (like the mosquito sign)
+    yellow_pixels = (r > 150) & (g > 120) & (b < 80) & (np.abs(r - g) < 60)
+    red_pixels = (r > 150) & (g < 80) & (b < 80)
+    if np.mean(yellow_pixels) > 0.22 and np.mean(red_pixels) < 0.05:
+        if np.argmax(preds) != 12:  # Class 12 is Priority Road (yellow diamond with white border)
+            return True, "Solid Yellow Diamond Sign detected (US / Novelty sign not in European GTSRB dataset)."
+            
+    # Calculate Shannon Entropy of predictions (high entropy = model is guessing blindly)
+    entropy = -np.sum(preds * np.log(preds + 1e-10))
+    if entropy > 1.35 or np.max(preds) < 0.60:
+        return True, "Low visual match or high uncertainty across the 43 trained classes."
+        
+    return False, ""
+
+st.title("🚦 AI Traffic Sign Recognition Dashboard")
+st.markdown("Upload an image or take a photo. **Drag the crop box** tightly around the sign (excluding text labels or wide backgrounds) for maximum accuracy.")
+
+with st.expander("📋 Click to view all 43 Traffic Signs supported by this model"):
+    st.write(", ".join([f"**{i+1}.** {name}" for i, name in enumerate(LABELS)]))
+
+col1, col2 = st.columns([1.1, 1])
 
 with col1:
-    uploaded_file = st.file_uploader("Upload Traffic Sign Image", type=["png", "jpg", "jpeg"])
+    input_mode = st.radio("Select Input Source:", ["📁 Upload Image File", "📷 Use Camera"], horizontal=True)
+    
+    if input_mode == "📁 Upload Image File":
+        uploaded_file = st.file_uploader("Upload Traffic Sign Photo", type=["png", "jpg", "jpeg", "webp"])
+    else:
+        uploaded_file = st.camera_input("Take a photo of a traffic sign")
+
+    enable_cropper = st.checkbox("✂️ Enable Interactive Cropper (Crop out bottom text & background)", value=True)
+
+    final_img = None
     if uploaded_file:
-        image = Image.open(uploaded_file).convert("RGB")
-        st.image(image, caption="Uploaded Traffic Sign", use_container_width=True)
+        raw_img = Image.open(uploaded_file).convert("RGB")
+        if enable_cropper:
+            st.caption("👇 Drag the corners of the red box to frame ONLY the traffic sign:")
+            final_img = st_cropper(raw_img, realtime_update=True, box_color="#FF4B4B", aspect_ratio=(1, 1))
+        else:
+            st.image(raw_img, caption="Uploaded Image", use_container_width=True)
+            final_img = raw_img
 
 with col2:
-    if uploaded_file:
-        resized = image.resize((64, 64))
+    if final_img is not None:
+        st.write("#### 🔍 Sign Sent to Neural Network (64×64):")
+        st.image(final_img.resize((120, 120)), width=120)
+        
+        resized = final_img.resize((64, 64), Image.Resampling.BILINEAR)
         arr = np.expand_dims(np.array(resized), axis=0)
         preds = model.predict(arr, verbose=0)[0]
         
         top_5_idx = np.argsort(preds)[::-1][:5]
-        best_label = LABELS[top_5_idx[0]]
-        best_conf = float(preds[top_5_idx[0]]) * 100
+        best_idx = int(top_5_idx[0])
+        best_label = LABELS[best_idx]
+        best_conf = float(preds[best_idx]) * 100
         
-        st.subheader(f"🎯 Prediction: **{best_label}**")
-        st.metric(label="Recognition Confidence", value=f"{best_conf:.1f}%")
+        is_unknown, reason = check_out_of_distribution(final_img, preds)
         
-        st.write("#### Top 5 Matches:")
+        if is_unknown:
+            st.error("⚠️ **Unrecognized / Out-of-Dataset Image**")
+            st.write(f"**Reason:** {reason}")
+            st.caption(f"Closest visual pattern in dataset: *{best_label}* ({best_conf:.1f}%)")
+        else:
+            category, advice = get_sign_category_and_advice(best_idx)
+            st.success(f"### 🎯 Prediction: **{best_label}**")
+            
+            m1, m2 = st.columns(2)
+            m1.metric("Recognition Confidence", f"{best_conf:.1f}%")
+            m2.metric("Sign Category", category.split()[1])
+            
+            st.info(f"**{category}**\n\n**Driver Action:** {advice}")
+            
+        st.write("#### 📊 Top 5 Probability Breakdown:")
         for idx in top_5_idx:
             pct = float(preds[idx])
             st.progress(pct, text=f"{LABELS[idx]} — {pct*100:.1f}%")
     else:
-        st.info("👈 Upload an image on the left to view recognition confidence scores.")
+        st.info("👈 Upload an image on the left to start analyzing.")
