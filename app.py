@@ -38,47 +38,27 @@ def get_sign_category_and_advice(idx):
     else:
         return "ℹ️ Priority / End of Restriction", "Standard highway priority or end of previous speed/passing zone."
 
-def is_not_recognizable(pil_img, preds, min_confidence):
-    """Returns (True, Reason) if the image is not recognizable as one of the 43 GTSRB signs."""
+def check_out_of_distribution(pil_img, preds):
+    """Detects novelty yellow diamond signs or high-uncertainty random photos."""
     arr = np.array(pil_img.resize((64, 64))).astype(int)
     r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-
-    # 1. Check for standard traffic sign colors (Red, Blue, or Yellow)
-    red_mask = (r > 135) & (r - g > 40) & (r - b > 40)
-    blue_mask = (b > 110) & (b - r > 35) & (b - g > 15)
-    yellow_mask = (r > 150) & (g > 120) & (b < 85) & (np.abs(r - g) < 60)
-
-    red_ratio = np.mean(red_mask)
-    blue_ratio = np.mean(blue_mask)
-    yellow_ratio = np.mean(yellow_mask)
-
-    best_idx = int(np.argmax(preds))
-    best_conf = float(preds[best_idx]) * 100
-
-    # Reject solid yellow US/novelty diamond signs (only Class 12 "Priority Road" has yellow in GTSRB)
-    if yellow_ratio > 0.20 and red_ratio < 0.05 and best_idx != 12:
-        return True, "This image uses a solid yellow sign format that does not exist in the 43 trained classes."
-
-    # Reject random photos/objects that lack red, blue, or yellow sign colors
-    # (Except black-and-white end-of-limit signs: classes 6, 32, 41, 42)
-    if best_idx not in [6, 32, 41, 42]:
-        if (red_ratio + blue_ratio + yellow_ratio) < 0.03:
-            return True, "No valid traffic sign color pattern (red/blue/yellow border) detected in the image."
-
-    # 2. Check if top confidence meets the required threshold
-    if best_conf < min_confidence:
-        return True, f"Recognition score ({best_conf:.1f}%) is below the {min_confidence}% minimum threshold."
-
-    # 3. Check if the model is confused between its top 2 guesses
-    sorted_preds = np.sort(preds)[::-1]
-    margin = (sorted_preds[0] - sorted_preds[1]) * 100
-    if margin < 25.0:
-        return True, "The model is split between multiple classes and cannot recognize this image reliably."
-
+    
+    # Detect solid yellow US/novelty signs (like the mosquito sign)
+    yellow_pixels = (r > 150) & (g > 120) & (b < 80) & (np.abs(r - g) < 60)
+    red_pixels = (r > 150) & (g < 80) & (b < 80)
+    if np.mean(yellow_pixels) > 0.22 and np.mean(red_pixels) < 0.05:
+        if np.argmax(preds) != 12:  # Class 12 is Priority Road (yellow diamond with white border)
+            return True, "Solid Yellow Diamond Sign detected (US / Novelty sign not in European GTSRB dataset)."
+            
+    # Calculate Shannon Entropy of predictions (high entropy = model is guessing blindly)
+    entropy = -np.sum(preds * np.log(preds + 1e-10))
+    if entropy > 1.35 or np.max(preds) < 0.60:
+        return True, "Low visual match or high uncertainty across the 43 trained classes."
+        
     return False, ""
 
 st.title("🚦 AI Traffic Sign Recognition Dashboard")
-st.markdown("Upload a traffic sign image. If the image is outside the 43 trained classes or unclear, the app will display **Not Recognizable**.")
+st.markdown("Upload an image or take a photo. **Drag the crop box** tightly around the sign (excluding text labels or wide backgrounds) for maximum accuracy.")
 
 with st.expander("📋 Click to view all 43 Traffic Signs supported by this model"):
     st.write(", ".join([f"**{i+1}.** {name}" for i, name in enumerate(LABELS)]))
@@ -93,8 +73,7 @@ with col1:
     else:
         uploaded_file = st.camera_input("Take a photo of a traffic sign")
 
-    enable_cropper = st.checkbox("✂️ Enable Interactive Cropper (Crop tightly around the sign)", value=True)
-    min_conf_slider = st.slider("Minimum Confidence Required (%)", min_value=50, max_value=95, value=75, step=5)
+    enable_cropper = st.checkbox("✂️ Enable Interactive Cropper (Crop out bottom text & background)", value=True)
 
     final_img = None
     if uploaded_file:
@@ -108,7 +87,7 @@ with col1:
 
 with col2:
     if final_img is not None:
-        st.write("#### 🔍 Cropped Sign Sent to AI (64×64):")
+        st.write("#### 🔍 Sign Sent to Neural Network (64×64):")
         st.image(final_img.resize((120, 120)), width=120)
         
         resized = final_img.resize((64, 64), Image.Resampling.BILINEAR)
@@ -120,29 +99,25 @@ with col2:
         best_label = LABELS[best_idx]
         best_conf = float(preds[best_idx]) * 100
         
-        not_recog, reason = is_not_recognizable(final_img, preds, min_conf_slider)
+        is_unknown, reason = check_out_of_distribution(final_img, preds)
         
-        if not_recog:
-            st.error("## 🚫 Not Recognizable")
-            st.warning(f"**Why:** {reason}")
-            st.caption("Please upload a clear photo of one of the 43 supported traffic signs and crop out any extra background or text.")
-            with st.expander("See raw internal probabilities (for debugging)"):
-                for idx in top_5_idx:
-                    pct = float(preds[idx])
-                    st.progress(pct, text=f"{LABELS[idx]} — {pct*100:.1f}%")
+        if is_unknown:
+            st.error("⚠️ **Unrecognized / Out-of-Dataset Image**")
+            st.write(f"**Reason:** {reason}")
+            st.caption(f"Closest visual pattern in dataset: *{best_label}* ({best_conf:.1f}%)")
         else:
             category, advice = get_sign_category_and_advice(best_idx)
-            st.success(f"## ✅ Recognized: **{best_label}**")
+            st.success(f"### 🎯 Prediction: **{best_label}**")
             
             m1, m2 = st.columns(2)
             m1.metric("Recognition Confidence", f"{best_conf:.1f}%")
-            m2.metric("Sign Type", category.split()[1])
+            m2.metric("Sign Category", category.split()[1])
             
             st.info(f"**{category}**\n\n**Driver Action:** {advice}")
             
-            st.write("#### 📊 Top 5 Probability Breakdown:")
-            for idx in top_5_idx:
-                pct = float(preds[idx])
-                st.progress(pct, text=f"{LABELS[idx]} — {pct*100:.1f}%")
+        st.write("#### 📊 Top 5 Probability Breakdown:")
+        for idx in top_5_idx:
+            pct = float(preds[idx])
+            st.progress(pct, text=f"{LABELS[idx]} — {pct*100:.1f}%")
     else:
         st.info("👈 Upload an image on the left to start analyzing.")
